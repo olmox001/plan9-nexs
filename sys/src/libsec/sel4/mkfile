@@ -1,0 +1,5 @@
+objtype=sel4
+</$objtype/mkfile
+
+install clean all:V:
+	exit

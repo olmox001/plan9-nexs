@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  plan9_aarch64.system — Four-PD seL4 Microkit system for Plan 9 on AArch64
+  ==========================================================================
+
+  Protection Domains:
+    plan9_root  — Plan 9 kernel + namespace + all user processes (cooperative)
+    9pserver    — rootfs: serves /bin, /rc, /lib, /usr via 9P protocol
+    display_pd  — virtio-gpu framebuffer driver
+    input_pd    — virtio-keyboard + virtio-tablet driver
+
+  Channels:
+    1: plan9_root <-> 9pserver    (9P rootfs transport)
+    2: plan9_root <-> display_pd  (framebuffer flush notification)
+    3: plan9_root <-> input_pd    (keyboard/mouse event notification)
+
+  Memory regions:
+    uart          — PL011 UART MMIO (console)
+    virtio_io     — 4KB page 0x0a003000 covering all three virtio-mmio slots:
+                      kbd   at offset 0xa00 (device 29 = 0x0a003a00)
+                      tablet at offset 0xc00 (device 30 = 0x0a003c00)
+                      gpu   at offset 0xe00 (device 31 = 0x0a003e00)
+    pool_root     — 64MB heap for plan9_root kernel allocator
+    shared_9p     — 64KB shared ring buffer for rootfs 9P transport
+    framebuffer   — 4MB shared BGRA framebuffer (plan9_root writes, display_pd flushes)
+    input_ring    — 64KB shared ring for mouse/keyboard events
+-->
+<system>
+    <!-- ── MMIO regions ─────────────────────────────────────────────────── -->
+    <memory_region name="uart"      phys_addr="0x09000000" size="0x1000" />
+    <!-- All three virtio-mmio devices (kbd/tablet/gpu) lie within the
+         single 4KB page 0x0a003000-0x0a003fff on QEMU virt aarch64.
+         Map it once; drivers address devices at +0xa00, +0xc00, +0xe00. -->
+    <memory_region name="virtio_io" phys_addr="0x0a003000" size="0x1000" />
+
+    <!-- ── Shared data regions ──────────────────────────────────────────── -->
+    <!-- 64MB heap at physical 0x10000000 (identity-mapped in plan9_root) -->
+    <memory_region name="pool_root"   size="0x4000000" page_size="0x200000" />
+    <!-- 64KB 9P ring buffer for rootfs channel -->
+    <memory_region name="shared_9p"   size="0x10000"                        />
+    <!-- 4MB framebuffer (plan9_root BGRA pixels -> display_pd -> GPU) -->
+    <memory_region name="framebuffer" size="0x400000"  page_size="0x200000" />
+    <!-- 64KB input event ring (input_pd events -> plan9_root devmouse) -->
+    <memory_region name="input_ring"  size="0x10000"                        />
+
+    <!-- ── plan9_root: Plan 9 kernel + scheduler + all user processes ──── -->
+    <protection_domain name="plan9_root" stack_size="0x200000" priority="99">
+        <program_image path="plan9_root.elf" />
+
+        <!-- Kernel heap at 0x10000000 (must match confinit()) -->
+        <map mr="pool_root"   vaddr="0x10000000" perms="rw" cached="true"  />
+        <!-- UART at 0x09000000 -->
+        <map mr="uart"        vaddr="0x09000000" perms="rw" cached="false" />
+        <!-- 9P rootfs ring at 0x20000000 (must match SHARE9P_BASE in devmntsel4.c) -->
+        <map mr="shared_9p"   vaddr="0x20000000" perms="rw" cached="true"  />
+        <!-- Framebuffer at 0x30000000 (must match SEL4_DRAW_BASE in devdraw.c) -->
+        <map mr="framebuffer" vaddr="0x30000000" perms="rw" cached="true"  />
+        <!-- Input ring at 0x40000000 (must match SEL4_INPUT_BASE in devmouse.c) -->
+        <map mr="input_ring"  vaddr="0x40000000" perms="rw" cached="true"  />
+    </protection_domain>
+
+    <!-- ── 9pserver: rootfs file server via 9P ──────────────────────────── -->
+    <protection_domain name="9pserver" stack_size="0x10000" priority="97">
+        <program_image path="9pserver.elf" />
+        <map mr="shared_9p" vaddr="0x20000000" perms="rw" cached="true"  />
+        <map mr="uart"      vaddr="0x09000000" perms="rw" cached="false" />
+    </protection_domain>
+
+    <!-- ── display_pd: virtio-gpu framebuffer driver ────────────────────── -->
+    <protection_domain name="display_pd" stack_size="0x10000" priority="98">
+        <program_image path="display_pd.elf" />
+        <!-- virtio_io page mapped at 0x0a003000; GPU regs are at +0xe00 = 0x0a003e00 -->
+        <map mr="virtio_io"   vaddr="0x0a003000" perms="rw" cached="false" />
+        <!-- Framebuffer read access (GPU DMA reads pixels) -->
+        <map mr="framebuffer" vaddr="0x30000000" perms="r"  cached="true"  />
+        <map mr="uart"        vaddr="0x09000000" perms="rw" cached="false" />
+    </protection_domain>
+
+    <!-- ── input_pd: keyboard and tablet driver ─────────────────────────── -->
+    <protection_domain name="input_pd" stack_size="0x10000" priority="100">
+        <program_image path="input_pd.elf" />
+        <!-- virtio_io page mapped at 0x0a003000; kbd at +0xa00, tablet at +0xc00 -->
+        <map mr="virtio_io"  vaddr="0x0a003000" perms="rw" cached="false" />
+        <!-- Input event ring: write mouse/kbd events here -->
+        <map mr="input_ring" vaddr="0x40000000" perms="rw" cached="true"  />
+        <!-- UART for keyboard -> console (plan9_root reads from UART ring) -->
+        <map mr="uart"       vaddr="0x09000000" perms="rw" cached="false" />
+    </protection_domain>
+
+    <!-- ── Channels ─────────────────────────────────────────────────────── -->
+    <!-- Channel 1: plan9_root <-> 9pserver (9P rootfs) -->
+    <channel>
+        <end pd="plan9_root" id="1" />
+        <end pd="9pserver"   id="1" />
+    </channel>
+
+    <!-- Channel 2: plan9_root -> display_pd (flush notification) -->
+    <channel>
+        <end pd="plan9_root" id="2" />
+        <end pd="display_pd" id="2" />
+    </channel>
+
+    <!-- Channel 3: input_pd -> plan9_root (mouse/kbd event notification) -->
+    <channel>
+        <end pd="input_pd"   id="3" />
+        <end pd="plan9_root" id="3" />
+    </channel>
+</system>
