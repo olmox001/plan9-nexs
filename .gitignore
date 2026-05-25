@@ -1,3 +1,4 @@
 *.o
 .venv/
 *.elf
+*.DS_Store
