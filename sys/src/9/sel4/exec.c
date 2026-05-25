@@ -28,6 +28,8 @@
 /* Forward declaration of kernel syscall dispatcher (syscall.c) */
 extern long syscall_dispatch(long sysno, long a0, long a1, long a2,
                               long a3, long a4, long a5);
+/* Global Tos pointer — written here, read by syscall_dispatch for errstr. */
+extern Tos *currenttos;
 
 /* Minimal ELF64 header structures */
 typedef struct Elf64Hdr Elf64Hdr;
@@ -108,6 +110,7 @@ exectrampoline(void *arg)
 
 	/* Install syscall gate — direct function pointer into plan9_root */
 	tos->gate = syscall_dispatch;
+	currenttos = tos;
 
 	/* Process identity */
 	tos->pid  = up ? up->pid : 0;
@@ -233,7 +236,14 @@ exec9p(char *path, char **args)
 	p->text = path;
 	p->kpfun  = exectrampoline;
 	p->kparg  = ctx;
-	p->fgrp   = allocfgrp();
+	if(up != nil && up->fgrp != nil)
+		p->fgrp = dupfgrp(up->fgrp);
+	else
+		p->fgrp = allocfgrp();
+	if(up != nil && up->dot != nil) {
+		p->dot = up->dot;
+		p->dot->ref_member.ref++;
+	}
 	p->syserrstr = p->errbuf0;
 	p->errstr    = p->errbuf1;
 	ready(p);
@@ -257,7 +267,65 @@ namec(char *name, int amode, int omode, ulong perm)
 
 	USED(amode); USED(perm);
 
-	if(name == nil || name[0] != '/')
+	putstrn("namec: ", 7);
+	putstrn(name ? name : "(nil)", name ? strlen(name) : 5);
+	putstrn("\n", 1);
+
+	if(name == nil)
+		error("namec: nil path");
+
+	/* Handle #X device-special paths (e.g. #d/0, #c/cons, #e/user) */
+	if(name[0] == '#') {
+		char  dc2;
+		char  buf2[512];
+		char *elems2[32];
+		int   nelem2, i2;
+		char *p2, *q2;
+
+		dc2 = name[1];
+		d = nil;
+		for(i2 = 0; devtab[i2] != nil; i2++) {
+			if(devtab[i2]->dc == dc2) {
+				d = devtab[i2];
+				break;
+			}
+		}
+		if(d == nil)
+			error("namec: unknown device");
+
+		c = d->attach("");
+		if(c == nil)
+			error("namec: attach failed");
+
+		/* Walk the path after '#X', skipping the optional leading '/' */
+		p2 = (char*)name + 2;
+		if(*p2 == '/') p2++;
+
+		if(*p2 != '\0') {
+			kstrcpy(buf2, p2, sizeof buf2);
+			nelem2 = 0;
+			p2 = buf2;
+			while(*p2 && nelem2 < 32) {
+				q2 = strchr(p2, '/');
+				if(q2 != nil) *q2 = '\0';
+				if(*p2) elems2[nelem2++] = p2;
+				if(q2 == nil) break;
+				p2 = q2 + 1;
+			}
+			if(nelem2 > 0) {
+				Walkqid *wq2 = d->walk(c, nil, elems2, nelem2);
+				if(wq2 == nil || wq2->nqid != nelem2) {
+					cclose(c);
+					error("namec: #X path not found");
+				}
+				c->qid = wq2->qid[nelem2 - 1];
+			}
+		}
+		c = d->open(c, omode);
+		return c;
+	}
+
+	if(name[0] != '/')
 		error("namec: relative paths not supported");
 
 	/* Find device by first path element or '#' prefix */
@@ -305,6 +373,6 @@ namec(char *name, int amode, int omode, ulong perm)
 		c->qid = wq->qid[nelem - 1];
 	}
 
-	d->open(c, omode);
+	c = d->open(c, omode);
 	return c;
 }

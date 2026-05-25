@@ -59,6 +59,11 @@
 #define SYS_SEMACQUIRE	37
 #define SYS_SEMRELEASE	38
 
+/* Global Tos pointer for errstr propagation back to user space.
+ * Safe to be global under single-CPU cooperative scheduling.
+ * Set by exectrampoline in exec.c before each user proc runs. */
+Tos *currenttos;
+
 /* ── Helper: get pid from scheduler ─────────────────────────────────────── */
 static int
 getpid(void)
@@ -108,13 +113,19 @@ sys_open(char *path, int mode)
 	Chan *c;
 	int   fd;
 
+	putstrn("sysopen: ", 9);
+	putstrn(path ? path : "(nil)", path ? strlen(path) : 5);
+	putstrn("\n", 1);
+
 	c = namec(path, Aopen, mode, 0);
 	if(waserror()){
 		cclose(c);
 		nexterror();
 	}
 	c->flag |= COPEN;
-	c->mode  = openmode(mode);
+	/* Do not overwrite mode if device open already set it (e.g. dupopen) */
+	if(c->mode == 0)
+		c->mode  = openmode(mode);
 	fd = newfd(c, 0);
 	poperror();
 	return fd;
@@ -232,6 +243,10 @@ sys_stat(char *path, uchar *buf, int n)
 {
 	Chan *c;
 	int   r;
+
+	putstrn("sysstat: ", 9);
+	putstrn(path ? path : "(nil)", path ? strlen(path) : 5);
+	putstrn("\n", 1);
 
 	c = namec(path, Aaccess, 0, 0);
 	if(waserror()){
@@ -494,7 +509,8 @@ syscall_dispatch(long sysno, long a0, long a1, long a2,
 	}
 
 	if(waserror()){
-		/* Copy error into the caller's Tos.errstr if possible */
+		if(currenttos != nil && up != nil)
+			kstrcpy(currenttos->errstr, up->errstr, sizeof(currenttos->errstr));
 		return -1LL;
 	}
 

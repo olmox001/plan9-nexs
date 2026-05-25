@@ -73,7 +73,7 @@
 			-> Scheduling Context: 'sched_context_monitor'
 
 	- TCB: 'tcb_plan9_root'
-		* IP: 0x207b10
+		* IP: 0x207eb8
 		* SP: 0x10000000000
 		* IPC Buffer: 0x2e4000
 		* Priority: 99

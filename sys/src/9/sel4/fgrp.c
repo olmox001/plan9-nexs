@@ -142,6 +142,8 @@ fdtochan(int fd, int mode, int chkmnt, int iref)
 			goto ok;
 		if((mode & ~OEXCL) == ORDWR)
 			goto ok;
+		if((c->mode & 3) == ORDWR)	/* ORDWR channel permits any access mode */
+			goto ok;
 		/* Mode mismatch */
 		if(iref)
 			cclose(c);

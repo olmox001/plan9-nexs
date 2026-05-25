@@ -53,6 +53,7 @@ void
 mnt9p_wakeup(void)
 {
 	wakeup(&mnt9p_rdz);
+	wakeup(&mnt9p_txrdz);
 }
 
 static void
