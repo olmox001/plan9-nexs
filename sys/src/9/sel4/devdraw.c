@@ -82,8 +82,6 @@ drawreset(void)
 	hdr->h      = DRAW_HEIGHT;
 	hdr->depth  = DRAW_DEPTH;
 	hdr->stride = DRAW_STRIDE;
-	/* Clear framebuffer to black */
-	memset(fbpix(), 0, DRAW_FBSIZE);
 	drawflush();
 }
 

@@ -31,6 +31,7 @@
     <!-- All three virtio-mmio devices (kbd/tablet/gpu) lie within the
          single 4KB page 0x0a003000-0x0a003fff on QEMU virt aarch64.
          Map it once; drivers address devices at +0xa00, +0xc00, +0xe00. -->
+    <!-- kbd at offset 0xc00 (slot 30 = 0x0a003c00), mouse at 0xe00 (slot 31 = 0x0a003e00) -->
     <memory_region name="virtio_io" phys_addr="0x0a003000" size="0x1000" />
 
     <!-- ── Shared data regions ──────────────────────────────────────────── -->
@@ -110,10 +111,10 @@
         <map mr="input_dma"  vaddr="0x7f000000" perms="rw" cached="true" />
         <!-- UART for keyboard -> console (plan9_root reads from UART ring) -->
         <map mr="uart"       vaddr="0x09000000" perms="rw" cached="false" />
-        <!-- Virtio Keyboard IRQ: GIC SPI 45 -> GIC IRQ 77 -->
-        <irq irq="77" id="1" />
-        <!-- Virtio Mouse/Tablet IRQ: GIC SPI 46 -> GIC IRQ 78 -->
-        <irq irq="78" id="2" />
+        <!-- Virtio Keyboard IRQ: GIC SPI 46 -> GIC IRQ 78 (slot 30) -->
+        <irq irq="78" id="1" />
+        <!-- Virtio Mouse/Tablet IRQ: GIC SPI 47 -> GIC IRQ 79 (slot 31) -->
+        <irq irq="79" id="2" />
     </protection_domain>
 
     <!-- ── Channels ─────────────────────────────────────────────────────── -->

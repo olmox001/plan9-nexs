@@ -334,15 +334,50 @@ init(void)
 	memset((void*)0x7f000000ULL, 0, 0x10000);
 	memset((void*)(uintptr)INPUT_BASE, 0, sizeof(InputRing));
 
-	if(vdev_init(&kbd_dev,   0x0a003a00, 1) == 0)
-		microkit_dbg_puts("input_pd: keyboard ok\n");
-	else
-		microkit_dbg_puts("input_pd: no keyboard\n");
+	uintptr slots[8];
+	int num_found = 0;
+	uintptr addr;
+	char dbg[128];
 
-	if(vdev_init(&mouse_dev, 0x0a003c00, 0) == 0)
-		microkit_dbg_puts("input_pd: mouse ok\n");
-	else
-		microkit_dbg_puts("input_pd: no mouse\n");
+	for(addr = 0x0a003000; addr <= 0x0a003e00; addr += 0x200) {
+		volatile u32int *m = (volatile u32int*)addr;
+		if(m[VIRTIO_MMIO_MAGIC/4] == 0x74726976) {
+			u32int devid = m[VIRTIO_MMIO_DEVICE_ID/4];
+			snprint(dbg, sizeof dbg,
+				"input_pd: VirtIO at 0x%lx id=%d\n",
+				(ulong)addr, (int)devid);
+			microkit_dbg_puts(dbg);
+			if(devid == 18 && num_found < 8)
+				slots[num_found++] = addr;
+		}
+	}
+
+	uintptr kbd_addr   = num_found >= 1 ? slots[0] : 0;
+	uintptr mouse_addr = num_found >= 2 ? slots[1] : 0;
+
+	if(kbd_addr != 0) {
+		snprint(dbg, sizeof dbg,
+			"input_pd: keyboard at 0x%lx\n", (ulong)kbd_addr);
+		microkit_dbg_puts(dbg);
+		if(vdev_init(&kbd_dev, kbd_addr, 1) == 0)
+			microkit_dbg_puts("input_pd: keyboard ok\n");
+		else
+			microkit_dbg_puts("input_pd: keyboard init failed\n");
+	} else {
+		microkit_dbg_puts("input_pd: no keyboard found\n");
+	}
+
+	if(mouse_addr != 0) {
+		snprint(dbg, sizeof dbg,
+			"input_pd: mouse at 0x%lx\n", (ulong)mouse_addr);
+		microkit_dbg_puts(dbg);
+		if(vdev_init(&mouse_dev, mouse_addr, 0) == 0)
+			microkit_dbg_puts("input_pd: mouse ok\n");
+		else
+			microkit_dbg_puts("input_pd: mouse init failed\n");
+	} else {
+		microkit_dbg_puts("input_pd: no mouse found\n");
+	}
 
 	microkit_dbg_puts("input_pd: ready\n");
 }

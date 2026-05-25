@@ -8,15 +8,35 @@ MICROKIT_BOARD ?= qemu_virt_aarch64
 MICROKIT_CONFIG ?= debug
 LLVM ?= True
 
-# Toolchain selection based on LLVM flag
-ifeq ($(LLVM),True)
+# Toolchain selection: board first, then LLVM flag
+ifeq ($(MICROKIT_BOARD),x86_64_generic)
+    ARCH_TARGET := x86_64
+else
+    ARCH_TARGET := aarch64
+endif
+
+ifeq ($(ARCH_TARGET),x86_64)
+  ifeq ($(LLVM),True)
+    CC := clang -target x86_64-none-elf
+    AR := llvm-ar
+    LD := ld.lld
+  else
+    CC := x86_64-elf-gcc
+    AR := x86_64-elf-ar
+    LD := x86_64-elf-ld
+  endif
+  CFLAGS_ARCH := -m64 -march=x86-64
+else
+  ifeq ($(LLVM),True)
     CC := clang -target aarch64-none-elf
     AR := llvm-ar
     LD := ld.lld
-else
+  else
     CC := aarch64-none-elf-gcc
     AR := aarch64-none-elf-ar
     LD := aarch64-none-elf-ld
+  endif
+  CFLAGS_ARCH := -mstrict-align -march=armv8-a
 endif
 
 # Board directory
@@ -24,11 +44,14 @@ BOARD_DIR := $(MICROKIT_SDK)/board/$(MICROKIT_BOARD)/$(MICROKIT_CONFIG)
 
 # Compiler flags
 # We pass -fplan9-extensions to support Plan 9 anonymous structs natively in GCC/Clang!
-CFLAGS_ARCH := -mstrict-align -march=armv8-a
 INCS := -I$(BUILD_DIR) -I../../../../sel4/include -I../../../include -I. -I./include -I../../libmp/port -I$(BOARD_DIR)/include
 CFLAGS := -O2 -g -Wall -Wextra -Wno-unknown-pragmas -Wno-unused-parameter \
           -Wno-unused-function -Wno-incompatible-pointer-types -ffreestanding \
           -fms-extensions -nostdlib -fcommon -include plan9_compat.h \
+          -Wno-missing-braces -Wno-microsoft-anon-tag \
+          -Wno-logical-op-parentheses -Wno-sign-compare \
+          -Wno-unused-value -Wno-int-in-bool-context \
+          -Wno-pointer-to-int-cast -Wno-comment \
           $(CFLAGS_ARCH) $(INCS)
 
 # Main output target

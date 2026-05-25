@@ -1,8 +1,8 @@
+#include <u.h>
 #include "../port/lib.h"
+#include "mem.h"
 #include "dat.h"
 #include "fns.h"
-#include "mem.h"
-#include <u.h>
 
 /*
  * PL011 UART hardware address on QEMU AArch64 'virt' board.

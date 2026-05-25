@@ -190,8 +190,10 @@ init(void)
 {
 	microkit_dbg_puts("display_pd: starting VGA mode\n");
 	gpu_init();
-	if(gpu_ok)
+	if(gpu_ok) {
 		gpu_create_fb();
+		gpu_flush();
+	}
 	microkit_dbg_puts("display_pd: ready\n");
 }
 
