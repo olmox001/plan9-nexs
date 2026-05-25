@@ -23,6 +23,11 @@
 #include "dat.h"
 #include "fns.h"
 #include "../port/error.h"
+#include "include/tos.h"
+
+/* Forward declaration of kernel syscall dispatcher (syscall.c) */
+extern long syscall_dispatch(long sysno, long a0, long a1, long a2,
+                              long a3, long a4, long a5);
 
 /* Minimal ELF64 header structures */
 typedef struct Elf64Hdr Elf64Hdr;
@@ -79,46 +84,52 @@ static void
 exectrampoline(void *arg)
 {
 	ExecCtx *ctx = (ExecCtx*)arg;
-
-	/* Set up a user stack with argv/envp */
-	uintptr *tos;
-	char   **argv;
-	uintptr *stk;
-	int      i, argc;
+	Tos     *tos;
+	uintptr  sp;
 	char    *ustack;
+	int      argc, i;
+	char   **argv;
 
-	argc   = ctx->argc;
-	argv   = ctx->argv;
-	ustack = (char*)xalloc(USTKSIZE);
+	argc = ctx->argc;
+	argv = ctx->argv;
+
+	/* Allocate user stack (256KB is plenty and avoids heap exhaustion) */
+	ulong stack_sz = 256 * 1024;
+	ustack = (char*)xalloc(stack_sz);
 	if(ustack == nil)
 		panic("exectrampoline: no stack memory");
 
-	tos = (uintptr*)(ustack + USTKSIZE);
-	tos = (uintptr*)STACKALIGN((uintptr)tos);
+	/* Place Tos at the top of the stack (Plan 9 ABI) */
+	sp = (uintptr)(ustack + stack_sz);
+	sp = STACKALIGN(sp);
+	sp -= sizeof(Tos);
+	tos = (Tos*)sp;
+	memset(tos, 0, sizeof(Tos));
 
-	/* Push envp terminator */
-	*--tos = 0;
-	/* Push argv strings */
-	uintptr *envp_sp = tos;
-	USED(envp_sp);
-	/* Push argv terminator */
-	*--tos = 0;
-	/* Reserve space for argv pointers */
-	tos -= argc;
-	for(i = 0; i < argc; i++)
-		tos[i] = (uintptr)argv[i];
-	argv = (char**)tos;
-	/* Push argc */
-	*--tos = (uintptr)argc;
+	/* Install syscall gate — direct function pointer into plan9_root */
+	tos->gate = syscall_dispatch;
 
-	/* Call the ELF entry point.  We use a C function call since we can't
-	 * do an inline asm branch to a dynamic address portably from C. */
-	typedef void (*EntryFn)(uintptr argc, char **argv, char **envp);
+	/* Process identity */
+	tos->pid  = up ? up->pid : 0;
+	tos->ppid = up && up->parent ? up->parent->pid : 0;
+
+	/* Argument vector */
+	tos->argc = argc;
+	tos->argv = argv;
+	tos->envp = nil;
+
+	/* Align stack below Tos (16-byte aligned per AArch64 ABI) */
+	sp = STACKALIGN(sp - 8);
+
+	/* Call ELF entry with R0 = Tos* (Plan 9 AArch64 ABI) */
+	typedef void (*EntryFn)(Tos *tos);
 	EntryFn fn = (EntryFn)(uintptr)ctx->entry;
-	fn((uintptr)argc, argv, nil);
+	fn(tos);
 
+	USED(i);
 	pexit("exec done", 1);
 }
+
 
 /*
  * exec9p: Load an ELF binary from the Plan 9 filesystem at path.
@@ -138,11 +149,8 @@ exec9p(char *path, char **args)
 	Proc       *p;
 	int         argc;
 
-	/* Open the binary */
-	if(waserror())
-		panic("exec9p: cannot open %s: %s", path, up->syserrstr);
+	/* Open the binary — let namec's error() propagate to the caller */
 	c = namec(path, Aopen, OREAD, 0);
-	poperror();
 
 	if(waserror()) {
 		cclose(c);
@@ -222,7 +230,7 @@ exec9p(char *path, char **args)
 	p = allocproc();
 	if(p == nil)
 		error("exec9p: out of procs");
-	kstrcpy(p->text, path, sizeof(p->text));
+	p->text = path;
 	p->kpfun  = exectrampoline;
 	p->kparg  = ctx;
 	p->fgrp   = allocfgrp();

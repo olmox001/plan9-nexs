@@ -17,6 +17,7 @@
  * using standard GCC/Clang universal character name (UCN) notation.
  */
 #define \u00B5s		us
+#define \u03C4conv	tauconv
 
 /* 
  * Patch for print.c _efgfmt(Fmt*) declaration, providing a dummy 
@@ -38,5 +39,10 @@
 /* Declaration for _barrier shim */
 extern uintptr _barrier(uintptr);
 #endif
+
+/* Userspace compatibility patches for GCC/Clang compiling Plan 9 commands */
+#define _STDLIB_H 1
+#define notifyf(a, b) notifyf(void *v_unused, b)
+#define biodummy(a, b, c) biodummy(Biobufhdr *bp_d, void *v_d, long l_d)
 
 #endif /* _PLAN9_COMPAT_H_ */

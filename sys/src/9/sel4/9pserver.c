@@ -63,8 +63,7 @@ srv_puts(char *s)
 	}
 }
 
-/* ── Embedded file content (placeholder — replace with real binaries) ─────── */
-#ifndef EMBED_BINARIES
+/* ── Embedded file content ────────────────────────────────────────────────── */
 static uchar rc_script_termrc[] =
 	"#!/bin/rc\n"
 	"# /rc/bin/termrc — terminal init script\n"
@@ -72,13 +71,46 @@ static uchar rc_script_termrc[] =
 	"prompt=('% ' '  ')\n"
 	"status=''\n";
 
+static uchar rc_script_rcmain[] =
+	"# rcmain: Plan 9 version\n"
+	"if(~ $#home 0) home=/\n"
+	"if(~ $#ifs 0) ifs=' \t\n'\n"
+	"switch($#prompt){\n"
+	"case 0\n"
+	"\tprompt=('% ' '\t')\n"
+	"case 1\n"
+	"\tprompt=($prompt '\t')\n"
+	"}\n"
+	"if(~ $rcname ?.out) prompt=('broken! ' '\t')\n"
+	"if(flag p) path=/bin\n"
+	"if not{\n"
+	"\tif(~ $#path 0) path=(/bin .)\n"
+	"}\n"
+	"fn sigexit\n"
+	"if(! ~ $#cflag 0){\n"
+	"\tstatus=''\n"
+	"\teval $cflag\n"
+	"}\n"
+	"if not if(flag i){\n"
+	"\tstatus=''\n"
+	"\tif(! ~ $#* 0) . $*\n"
+	"\t. -i '#d/0'\n"
+	"}\n"
+	"if not if(~ $#* 0) . '#d/0'\n"
+	"if not{\n"
+	"\tstatus=''\n"
+	"\t. $*\n"
+	"}\n";
+
+static uchar env_rcname[] = "rc";
+static uchar env_pid[]    = "2";
+static uchar env_cflag[]  = "";
+
+#ifndef EMBED_BINARIES
 static uchar rc_bin_rc[] =
 	"#! /bin/rc\n"
 	"# rc: minimal shell placeholder\n"
 	"# Replace this file with a real Plan 9 rc binary.\n";
-#else
-#include "embedded_bins.h"
-#endif
 
 /* ── Static file system tree ────────────────────────────────────────────── */
 enum { MAXFID = 64, MAXPATH = 256, MAXFILES = 64 };
@@ -99,13 +131,59 @@ static FSEntry fstree[] = {
 	{ "/rc",            1, DMDIR|0555, nil, 0 },
 	{ "/rc/bin",        1, DMDIR|0555, nil, 0 },
 	{ "/rc/bin/termrc", 0, 0755, rc_script_termrc, sizeof(rc_script_termrc)-1 },
+	{ "/rc/lib",        1, DMDIR|0555, nil, 0 },
+	{ "/rc/lib/rcmain", 0, 0755, rc_script_rcmain, sizeof(rc_script_rcmain)-1 },
 	{ "/lib",           1, DMDIR|0555, nil, 0 },
 	{ "/lib/font",      1, DMDIR|0555, nil, 0 },
 	{ "/env",           1, DMDIR|0555, nil, 0 },
+	{ "/env/rcname",    0, 0666, env_rcname,     sizeof(env_rcname)-1 },
+	{ "/env/pid",       0, 0666, env_pid,        sizeof(env_pid)-1 },
+	{ "/env/cflag",     0, 0666, env_cflag,      sizeof(env_cflag)-1 },
 	{ "/dev",           1, DMDIR|0555, nil, 0 },
 	{ "/usr",           1, DMDIR|0555, nil, 0 },
 	{ "/usr/root",      1, DMDIR|0755, nil, 0 },
 };
+#else
+#include "embedded_bins.h"
+
+/* ── Static file system tree ────────────────────────────────────────────── */
+enum { MAXFID = 64, MAXPATH = 256, MAXFILES = 64 };
+
+typedef struct FSEntry FSEntry;
+struct FSEntry {
+	char   path[MAXPATH];   /* full path, e.g. "/bin/rc" */
+	int    isdir;
+	ulong  mode;
+	uchar *data;            /* nil for directories */
+	ulong  size;
+};
+
+static FSEntry fstree[] = {
+	{ "/",              1, DMDIR|0555, nil, 0 },
+	{ "/bin",           1, DMDIR|0555, nil, 0 },
+	{ "/bin/rc",        0, 0755, bin_rc,         sizeof(bin_rc) },
+	{ "/bin/echo",      0, 0755, bin_echo,       sizeof(bin_echo) },
+	{ "/bin/cat",       0, 0755, bin_cat,        sizeof(bin_cat) },
+	{ "/bin/ls",        0, 0755, bin_ls,         sizeof(bin_ls) },
+	{ "/bin/pwd",       0, 0755, bin_pwd,        sizeof(bin_pwd) },
+	{ "/bin/mkdir",     0, 0755, bin_mkdir,      sizeof(bin_mkdir) },
+	{ "/bin/rm",        0, 0755, bin_rm,         sizeof(bin_rm) },
+	{ "/rc",            1, DMDIR|0555, nil, 0 },
+	{ "/rc/bin",        1, DMDIR|0555, nil, 0 },
+	{ "/rc/bin/termrc", 0, 0755, rc_script_termrc, sizeof(rc_script_termrc)-1 },
+	{ "/rc/lib",        1, DMDIR|0555, nil, 0 },
+	{ "/rc/lib/rcmain", 0, 0755, rc_script_rcmain, sizeof(rc_script_rcmain)-1 },
+	{ "/lib",           1, DMDIR|0555, nil, 0 },
+	{ "/lib/font",      1, DMDIR|0555, nil, 0 },
+	{ "/env",           1, DMDIR|0555, nil, 0 },
+	{ "/env/rcname",    0, 0666, env_rcname,     sizeof(env_rcname)-1 },
+	{ "/env/pid",       0, 0666, env_pid,        sizeof(env_pid)-1 },
+	{ "/env/cflag",     0, 0666, env_cflag,      sizeof(env_cflag)-1 },
+	{ "/dev",           1, DMDIR|0555, nil, 0 },
+	{ "/usr",           1, DMDIR|0555, nil, 0 },
+	{ "/usr/root",      1, DMDIR|0755, nil, 0 },
+};
+#endif
 #define NFSTREE ((int)(sizeof(fstree)/sizeof(fstree[0])))
 
 /* ── FID table ───────────────────────────────────────────────────────────── */
@@ -282,16 +360,25 @@ handle_9p(Shared9P *s)
 			Fid *f = fid_lookup(req.fid);
 			if(f == nil) { rep.type = Rerror; rep.ename = "unknown fid"; break; }
 
+			char dbgbuf[256];
+			snprint(dbgbuf, sizeof dbgbuf, "9pserver Twalk fid=%ud newfid=%ud nwname=%d\n", req.fid, req.newfid, req.nwname);
+			srv_puts(dbgbuf);
+
 			int cur   = f->fsidx;
 			int nok   = 0;
 			Qid qids[MAXWELEM];
 
 			for(i = 0; i < req.nwname; i++) {
 				int next = fs_walk(cur, req.wname[i]);
+				snprint(dbgbuf, sizeof dbgbuf, "  walk step %d: %s from idx %d -> idx %d\n", i, req.wname[i], cur, next);
+				srv_puts(dbgbuf);
 				if(next < 0) break;
 				qids[nok++] = fs_qid(next);
 				cur = next;
 			}
+
+			snprint(dbgbuf, sizeof dbgbuf, "  walk result: nok=%d\n", nok);
+			srv_puts(dbgbuf);
 
 			if(nok < req.nwname) {
 				if(nok == 0) { rep.type = Rerror; rep.ename = "file not found"; break; }
@@ -367,6 +454,7 @@ handle_9p(Shared9P *s)
 				} else {
 					n = e->size - (int)off;
 					if(n > (int)req.count) n = req.count;
+					if(n > (int)sizeof(msg_out)) n = sizeof(msg_out);
 					memmove(msg_out, e->data + off, n);
 					rep.data  = (char*)msg_out;
 					rep.count = n;
@@ -423,8 +511,12 @@ init(void)
 {
 	Shared9P *s = (Shared9P*)SHARE9P_BASE;
 	srv_puts("9pserver: ready\n");
-	memset(s, 0, sizeof(Shared9P));
+	/* Shared memory is zero-initialized by Microkit — do NOT memset it,
+	 * because plan9_root (higher priority) may have already written a
+	 * T-message to the tx ring before our init() runs. */
 	memset(fids, 0, sizeof(fids));
+	/* Process any T-messages that arrived before we were scheduled. */
+	handle_9p(s);
 }
 
 void

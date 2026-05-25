@@ -269,6 +269,44 @@ pipewrite(Chan *c, void *buf, long n, vlong off)
 	return count;
 }
 
+void
+devpipealloc(Chan *c[2])
+{
+	Pipe *p;
+	int   idx;
+
+	p = pipealloc();
+	if(p == nil)
+		error("pipe: too many open pipes");
+	idx = p - pipes;
+
+	c[0] = devattach('|', "");
+	if(c[0] == nil) {
+		pipefree(p);
+		error("pipe: attach failed");
+	}
+	c[1] = devattach('|', "");
+	if(c[1] == nil) {
+		cclose(c[0]);
+		pipefree(p);
+		error("pipe: attach failed");
+	}
+
+	c[0]->qid.path  = pipepath(idx, 0);
+	c[0]->qid.type  = QTFILE;
+	c[0]->qid.vers  = 0;
+	c[0]->flag     |= COPEN;
+	c[0]->mode      = OREAD;
+	c[0]->aux       = p;
+
+	c[1]->qid.path  = pipepath(idx, 1);
+	c[1]->qid.type  = QTFILE;
+	c[1]->qid.vers  = 0;
+	c[1]->flag     |= COPEN;
+	c[1]->mode      = OWRITE;
+	c[1]->aux       = p;
+}
+
 Dev pipedevtab = {
 	'|',
 	"pipe",

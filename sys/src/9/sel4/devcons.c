@@ -38,6 +38,36 @@ static Dirtab consdir[] = {
 	"reboot",  {Qreboot,  0, QTFILE}, 0,         0220,
 };
 
+/* Keyboard ring buffer: filled by consinput(), drained by consread(Qcons) */
+static uchar kbuf[256];
+static uint  kbuf_r;
+static uint  kbuf_w;
+
+/* Rendez that consread sleeps on; woken by consinput() */
+static Rendez cons_rdz;
+
+static int
+kbuf_hasdata(void *v)
+{
+	USED(v);
+	coherence();
+	return kbuf_r != kbuf_w;
+}
+
+/*
+ * consinput: called from uart_kbd_poll / notified when a key arrives.
+ * Safe to call from any context (no lock needed — single writer path
+ * under cooperative scheduling).
+ */
+void
+consinput(int c)
+{
+	kbuf[kbuf_w % sizeof kbuf] = (uchar)c;
+	coherence();
+	kbuf_w++;
+	wakeup(&cons_rdz);
+}
+
 static void
 consreset(void)
 {
@@ -85,10 +115,14 @@ consread(Chan *c, void *buf, long n, vlong off)
 		return devdirread(c, buf, n, consdir, nelem(consdir), devgen);
 
 	switch((int)c->qid.path) {
-	case Qcons:
-		/* No keyboard under seL4 Microkit — return EOF */
+	case Qcons: {
+		long cnt = 0;
 		USED(off);
-		return 0;
+		sleep(&cons_rdz, kbuf_hasdata, nil);
+		while(cnt < n && kbuf_hasdata(nil))
+			((uchar*)buf)[cnt++] = kbuf[kbuf_r++ % sizeof kbuf];
+		return cnt;
+	}
 
 	case Qnull:
 		return 0;

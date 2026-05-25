@@ -1,15 +1,18 @@
 /*
  * display/main.c — Display Protection Domain for Plan 9 on seL4 Microkit.
  *
- * This PD manages the virtio-gpu device exposed by QEMU's virt machine.
- * It shares a 4MB framebuffer region with plan9_root; when plan9_root
- * sends a notification on channel SEL4_DRAW_CH (=2), this PD flushes the
- * framebuffer to the GPU scanout.
+ * This PD manages the PCIe standard VGA card (Bochs VGA with legacy emulation)
+ * emulated by QEMU. It shares a 4MB framebuffer region with plan9_root;
+ * when plan9_root sends a notification on channel SEL4_DRAW_CH (=2), this PD
+ * flushes the framebuffer directly to the VGA linear framebuffer mapped on PCI.
  *
- * virtio-gpu MMIO base: 0x0a003e00 (virtio device 31 on qemu virt aarch64)
- * Framebuffer shared mem: mapped at 0x30000000 (same as plan9_root)
+ * PCI physical address mappings:
+ *   PCI ECAM (Config Space): phys 0x3f000000, mapped at vaddr 0x3f000000 (1MB, uncached)
+ *   VGA Framebuffer BAR 0:    phys 0x38000000, mapped at vaddr 0x38000000 (16MB, uncached)
+ *   VGA VBE Registers BAR 2:  phys 0x3c000000, mapped at vaddr 0x3c000000 (4KB, uncached)
  *
- * Build: compiled separately as display_pd.elf linked against libmicrokit.
+ * Shared memory:
+ *   Plan 9 Framebuffer:       phys 0x7d000000, mapped at vaddr 0x7d000000 (4MB, cached)
  */
 
 #include <u.h>
@@ -20,291 +23,181 @@
 #undef fault
 #undef strcpy
 
-/* ── virtio-mmio register offsets (spec 1.2 §4.2.2) ─────────────────────── */
-#define VIRTIO_MMIO_MAGIC           0x000
-#define VIRTIO_MMIO_VERSION         0x004
-#define VIRTIO_MMIO_DEVICE_ID       0x008
-#define VIRTIO_MMIO_VENDOR_ID       0x00c
-#define VIRTIO_MMIO_DEV_FEATURES    0x010
-#define VIRTIO_MMIO_DRV_FEATURES    0x020
-#define VIRTIO_MMIO_QUEUE_SEL       0x030
-#define VIRTIO_MMIO_QUEUE_NUM_MAX   0x034
-#define VIRTIO_MMIO_QUEUE_NUM       0x038
-#define VIRTIO_MMIO_QUEUE_READY     0x044
-#define VIRTIO_MMIO_QUEUE_NOTIFY    0x050
-#define VIRTIO_MMIO_INT_STATUS      0x060
-#define VIRTIO_MMIO_INT_ACK         0x064
-#define VIRTIO_MMIO_STATUS          0x070
-#define VIRTIO_MMIO_QUEUE_DESC_LO   0x080
-#define VIRTIO_MMIO_QUEUE_DESC_HI   0x084
-#define VIRTIO_MMIO_QUEUE_DRIVER_LO 0x090
-#define VIRTIO_MMIO_QUEUE_DRIVER_HI 0x094
-#define VIRTIO_MMIO_QUEUE_DEVICE_LO 0x0a0
-#define VIRTIO_MMIO_QUEUE_DEVICE_HI 0x0a4
-#define VIRTIO_MMIO_CONFIG_GEN      0x0fc
-#define VIRTIO_MMIO_CONFIG          0x100
+/* ── Bochs VBE (Dispi) register indices (shifted left by 1 for word access) ── */
+#define VBE_DISPI_INDEX_ID          0x0
+#define VBE_DISPI_INDEX_XRES        0x1
+#define VBE_DISPI_INDEX_YRES        0x2
+#define VBE_DISPI_INDEX_BPP         0x3
+#define VBE_DISPI_INDEX_ENABLE      0x4
+#define VBE_DISPI_INDEX_BANK        0x5
+#define VBE_DISPI_INDEX_VIRT_WIDTH  0x6
+#define VBE_DISPI_INDEX_VIRT_HEIGHT 0x7
+#define VBE_DISPI_INDEX_X_OFFSET    0x8
+#define VBE_DISPI_INDEX_Y_OFFSET    0x9
 
-/* ── virtio status bits ──────────────────────────────────────────────────── */
-#define VIRTIO_S_ACKNOWLEDGE  1
-#define VIRTIO_S_DRIVER       2
-#define VIRTIO_S_DRIVER_OK    4
-#define VIRTIO_S_FEATURES_OK  8
-#define VIRTIO_S_FAILED      128
+#define VBE_DISPI_DISABLED          0x00
+#define VBE_DISPI_ENABLED           0x01
+#define VBE_DISPI_LFB_ENABLED       0x40
 
-/* ── virtio-gpu commands ─────────────────────────────────────────────────── */
-#define VIRTIO_GPU_CMD_GET_DISPLAY_INFO      0x0100
-#define VIRTIO_GPU_CMD_RESOURCE_CREATE_2D    0x0101
-#define VIRTIO_GPU_CMD_RESOURCE_UNREF        0x0102
-#define VIRTIO_GPU_CMD_SET_SCANOUT           0x0103
-#define VIRTIO_GPU_CMD_RESOURCE_FLUSH        0x0104
-#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D   0x0105
-#define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
-
-#define VIRTIO_GPU_RESP_OK_NODATA            0x1100
-#define VIRTIO_GPU_RESP_OK_DISPLAY_INFO      0x1101
-
-#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM     1
-
-/* ── vring structures (spec 2.7) ─────────────────────────────────────────── */
-#define VRING_QUEUE_SIZE 16
-
-typedef struct VRingDesc VRingDesc;
-struct VRingDesc {
-	u64int addr;
-	u32int len;
-	u16int flags;
-	u16int next;
-};
-
-#define VRING_DESC_F_WRITE 2
-
-typedef struct VRingAvail VRingAvail;
-struct VRingAvail {
-	u16int flags;
-	u16int idx;
-	u16int ring[VRING_QUEUE_SIZE];
-};
-
-typedef struct VRingUsedElem VRingUsedElem;
-struct VRingUsedElem { u32int id; u32int len; };
-
-typedef struct VRingUsed VRingUsed;
-struct VRingUsed {
-	u16int flags;
-	u16int idx;
-	VRingUsedElem ring[VRING_QUEUE_SIZE];
-};
-
-/* ── GPU header (all commands/responses start with this) ─────────────────── */
-typedef struct GpuHdr GpuHdr;
-struct GpuHdr { u32int type; u32int flags; u64int fence_id; u32int ctx_id; u32int padding; };
-
-typedef struct GpuRect GpuRect;
-struct GpuRect { u32int x; u32int y; u32int width; u32int height; };
-
-typedef struct GpuCreate2D GpuCreate2D;
-struct GpuCreate2D { GpuHdr hdr; u32int resource_id; u32int format; u32int width; u32int height; };
-
-typedef struct GpuSetScanout GpuSetScanout;
-struct GpuSetScanout { GpuHdr hdr; GpuRect r; u32int scanout_id; u32int resource_id; };
-
-typedef struct GpuFlush GpuFlush;
-struct GpuFlush { GpuHdr hdr; GpuRect r; u32int resource_id; u32int padding; };
-
-typedef struct GpuTransfer GpuTransfer;
-struct GpuTransfer { GpuHdr hdr; GpuRect r; u64int offset; u32int resource_id; u32int padding; };
-
-typedef struct GpuAttachBacking GpuAttachBacking;
-struct GpuAttachBacking {
-	GpuHdr  hdr;
-	u32int  resource_id;
-	u32int  nr_entries;
-	u64int  addr;
-	u32int  length;
-	u32int  padding;
-};
-
-/* ── Hardware base addresses ─────────────────────────────────────────────── */
-#define VIRTIO_GPU_MMIO   0x0a003e00ULL
-#define FB_VADDR          0x30000000ULL
-#define FB_HEADER_SIZE    16   /* FBHeader: w, h, depth, stride */
+/* ── Display dimensions (1024x768x32bpp) ────────────────────────────────── */
 #define DRAW_WIDTH        1024
 #define DRAW_HEIGHT       768
+#define DRAW_DEPTH        32
 #define DRAW_STRIDE       (DRAW_WIDTH * 4)
 #define DRAW_FBSIZE       (DRAW_HEIGHT * DRAW_STRIDE)
-#define RESOURCE_ID       1
 
-static volatile u32int *gpu;
+#define FB_PHYS           0x7d000000ULL
+#define FB_HEADER_SIZE    16
 
-static u32int r32(u32int off) { return gpu[off/4]; }
-static void   w32(u32int off, u32int v) { gpu[off/4] = v; }
-
-/* DMA-capable buffers (allocated in our own memory space) */
-static VRingDesc  desc[VRING_QUEUE_SIZE]   __attribute__((aligned(4096)));
-static VRingAvail avail                    __attribute__((aligned(2)));
-static VRingUsed  used                     __attribute__((aligned(4096)));
-
-/* Command/response buffers */
-static u8int      cmdbuf[512]              __attribute__((aligned(64)));
-static u8int      rspbuf[512]              __attribute__((aligned(64)));
-
-static u16int desc_head;
+static volatile u32int *pci_ecam;
+static volatile u16int *vbe;
+static volatile u32int *vga_fb;
+static int             gpu_ok;
 
 static void
-gpu_cmd(void *cmd, u32int cmdlen, void *rsp, u32int rsplen)
+uart_puts(const char *s)
 {
-	u16int d0, d1, ai;
+	volatile u32int *uart = (volatile u32int*)0x09000000;
+	while(*s) {
+		while(uart[6] & (1u << 5)) /* FR.TXFF */
+			;
+		uart[0] = (u32int)(unsigned char)*s++;
+	}
+}
 
-	d0 = desc_head % VRING_QUEUE_SIZE;
-	d1 = (desc_head + 1) % VRING_QUEUE_SIZE;
-	desc_head += 2;
+static void
+pci_init(void)
+{
+	pci_ecam = (volatile u32int*)0x3f000000;
+	int dev;
 
-	memmove(cmdbuf, cmd, cmdlen);
+	/* Scan Bus 0, slots 1..31 to find the QEMU Standard VGA Card (Vendor 1234, Device 1111) */
+	for(dev = 1; dev < 32; dev++) {
+		volatile u32int *dev_cfg = (volatile u32int*)((uintptr)pci_ecam + (dev << 15));
+		u32int id = dev_cfg[0];
+		if((id & 0xffff) == 0x1234) {
+			/* Found the standard PCI VGA Card! */
+			/* 1. Configure BAR 0 to physical 0x38000000 */
+			dev_cfg[4] = 0x38000000;
+			/* 2. Configure BAR 2 to physical 0x3c000000 */
+			dev_cfg[6] = 0x3c000000;
+			/* 3. Enable Memory Space access + Bus Master in Command register (offset 0x04) */
+			u32int cmd_status = dev_cfg[1];
+			dev_cfg[1] = (cmd_status & 0xffff0000) | 0x0006;
+			
+			__asm__ volatile("dsb sy; isb" ::: "memory");
 
-	desc[d0].addr  = (u64int)(uintptr)cmdbuf;
-	desc[d0].len   = cmdlen;
-	desc[d0].flags = 1;   /* NEXT */
-	desc[d0].next  = d1;
+			char dbg[256];
+			snprint(dbg, sizeof dbg, "display_pd: found QEMU PCI VGA on dev %d, mapped BAR0=0x38000000 BAR2=0x3c000000\n", dev);
+			uart_puts(dbg);
 
-	desc[d1].addr  = (u64int)(uintptr)rspbuf;
-	desc[d1].len   = rsplen;
-	desc[d1].flags = VRING_DESC_F_WRITE;
-	desc[d1].next  = 0;
+			/* Read back BARs and Command to verify configuration succeeded */
+			u32int read_bar0 = dev_cfg[4];
+			u32int read_bar2 = dev_cfg[6];
+			u32int read_cmd = dev_cfg[1];
+			snprint(dbg, sizeof dbg, "display_pd DIAG PCI: BAR0_read=0x%x BAR2_read=0x%x CMD_read=0x%x\n", read_bar0, read_bar2, read_cmd);
+			uart_puts(dbg);
+			return;
+		}
+	}
+	uart_puts("display_pd: ERROR: QEMU VGA card not found on PCIe bus!\n");
+}
 
-	ai = avail.idx % VRING_QUEUE_SIZE;
-	avail.ring[ai] = d0;
-	__sync_synchronize();
-	avail.idx++;
-	__sync_synchronize();
+static void
+vga_unblank(void)
+{
+	/* Remapped standard VGA registers start at BAR 2 + 0x400 */
+	volatile u8int *vga = (volatile u8int*)0x3c000400;
 
-	w32(VIRTIO_MMIO_QUEUE_NOTIFY, 0);
+	/* Reset flip-flop of Attribute Controller by reading Input Status Register 1 at offset 0x1a (0x3da) */
+	volatile u8int *isr1 = (volatile u8int*)(0x3c000400 + 0x1a);
+	(void)*isr1;
 
-	/* Poll until device processes it */
-	while(used.idx != avail.idx)
-		__asm__ volatile("" ::: "memory");
+	/* Write 0x20 to Attribute Controller Index (offset 0x00 = 0x3c0) to unblank the screen (bit 5 = 1) */
+	vga[0] = 0x20;
 
-	if(rsp)
-		memmove(rsp, rspbuf, rsplen);
+	/* Unblank Sequencer: Sequencer Index is at offset 0x04 (0x3c4), Data at 0x05 (0x3c5).
+	   We want to set Index 1 (Clocking Mode) bit 5 (Screen Off) to 0. */
+	vga[4] = 0x01;
+	u8int clk_mode = vga[5];
+	vga[5] = clk_mode & ~0x20;
+
+	__asm__ volatile("dsb sy; isb" ::: "memory");
+	uart_puts("display_pd: Sequencer and Attribute Controller unblanked\n");
+}
+
+static void
+vbe_write(u32int reg, u16int val)
+{
+	/* VBE registers are accessed via BAR 2 at offset 0x500 + (reg << 1) */
+	vbe[reg] = val;
 }
 
 static void
 gpu_init(void)
 {
-	u32int status = 0;
+	pci_init();
+	vga_unblank();
+	
+	vbe = (volatile u16int*)0x3c000500;
+	vga_fb = (volatile u32int*)0x38000000;
 
-	gpu = (volatile u32int*)(uintptr)VIRTIO_GPU_MMIO;
+	/* Configure VESA VBE resolution via MMIO registers */
+	vbe_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+	vbe_write(VBE_DISPI_INDEX_XRES, DRAW_WIDTH);
+	vbe_write(VBE_DISPI_INDEX_YRES, DRAW_HEIGHT);
+	vbe_write(VBE_DISPI_INDEX_BPP, DRAW_DEPTH);
+	vbe_write(VBE_DISPI_INDEX_VIRT_WIDTH, DRAW_WIDTH);
+	vbe_write(VBE_DISPI_INDEX_VIRT_HEIGHT, DRAW_HEIGHT);
+	vbe_write(VBE_DISPI_INDEX_BANK, 0);
+	vbe_write(VBE_DISPI_INDEX_X_OFFSET, 0);
+	vbe_write(VBE_DISPI_INDEX_Y_OFFSET, 0);
+	vbe_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
 
-	if(r32(VIRTIO_MMIO_MAGIC) != 0x74726976) {
-		microkit_dbg_puts("display_pd: no virtio-gpu found\n");
-		return;
-	}
-	if(r32(VIRTIO_MMIO_DEVICE_ID) != 16) {
-		microkit_dbg_puts("display_pd: not a GPU device\n");
-		return;
-	}
+	__asm__ volatile("dsb sy; isb" ::: "memory");
 
-	/* Reset */
-	w32(VIRTIO_MMIO_STATUS, 0);
-	status |= VIRTIO_S_ACKNOWLEDGE; w32(VIRTIO_MMIO_STATUS, status);
-	status |= VIRTIO_S_DRIVER;      w32(VIRTIO_MMIO_STATUS, status);
-	/* Accept all features */
-	w32(VIRTIO_MMIO_DEV_FEATURES, 0);
-	w32(VIRTIO_MMIO_DRV_FEATURES, 0);
-	status |= VIRTIO_S_FEATURES_OK; w32(VIRTIO_MMIO_STATUS, status);
-	status |= VIRTIO_S_DRIVER_OK;   w32(VIRTIO_MMIO_STATUS, status);
+	gpu_ok = 1;
+	microkit_dbg_puts("display_pd: standard VGA initialized via VBE\n");
 
-	/* Set up virtqueue 0 */
-	w32(VIRTIO_MMIO_QUEUE_SEL, 0);
-	u32int qmax = r32(VIRTIO_MMIO_QUEUE_NUM_MAX);
-	if(qmax < VRING_QUEUE_SIZE) {
-		microkit_dbg_puts("display_pd: queue too small\n");
-		return;
-	}
-	w32(VIRTIO_MMIO_QUEUE_NUM, VRING_QUEUE_SIZE);
-	w32(VIRTIO_MMIO_QUEUE_DESC_LO,   (u32int)(uintptr)desc);
-	w32(VIRTIO_MMIO_QUEUE_DESC_HI,   (u32int)((uintptr)desc >> 32));
-	w32(VIRTIO_MMIO_QUEUE_DRIVER_LO, (u32int)(uintptr)&avail);
-	w32(VIRTIO_MMIO_QUEUE_DRIVER_HI, (u32int)((uintptr)&avail >> 32));
-	w32(VIRTIO_MMIO_QUEUE_DEVICE_LO, (u32int)(uintptr)&used);
-	w32(VIRTIO_MMIO_QUEUE_DEVICE_HI, (u32int)((uintptr)&used >> 32));
-	w32(VIRTIO_MMIO_QUEUE_READY, 1);
-
-	microkit_dbg_puts("display_pd: virtio-gpu initialized\n");
+	/* Read back VBE registers to verify they were configured correctly */
+	char dbg[256];
+	u16int vbe_id = vbe[VBE_DISPI_INDEX_ID];
+	u16int vbe_enable = vbe[VBE_DISPI_INDEX_ENABLE];
+	u16int vbe_xres = vbe[VBE_DISPI_INDEX_XRES];
+	u16int vbe_yres = vbe[VBE_DISPI_INDEX_YRES];
+	u16int vbe_bpp = vbe[VBE_DISPI_INDEX_BPP];
+	snprint(dbg, sizeof dbg, "display_pd DIAG VBE: VBE_ID=0x%x ENABLE=0x%x XRES=%d YRES=%d BPP=%d\n", vbe_id, vbe_enable, vbe_xres, vbe_yres, vbe_bpp);
+	uart_puts(dbg);
 }
 
 static void
 gpu_create_fb(void)
 {
-	GpuCreate2D    cmd;
-	GpuHdr         rsp;
-	GpuAttachBacking ab;
-	GpuSetScanout  ss;
-
-	/* Create 2D resource */
-	memset(&cmd, 0, sizeof cmd);
-	cmd.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
-	cmd.resource_id = RESOURCE_ID;
-	cmd.format      = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
-	cmd.width       = DRAW_WIDTH;
-	cmd.height      = DRAW_HEIGHT;
-	gpu_cmd(&cmd, sizeof cmd, &rsp, sizeof rsp);
-
-	/* Attach backing: point GPU at our framebuffer pixels */
-	memset(&ab, 0, sizeof ab);
-	ab.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-	ab.resource_id = RESOURCE_ID;
-	ab.nr_entries  = 1;
-	ab.addr        = (u64int)(FB_VADDR + FB_HEADER_SIZE);
-	ab.length      = DRAW_FBSIZE;
-	gpu_cmd(&ab, sizeof ab, &rsp, sizeof rsp);
-
-	/* Set scanout to this resource */
-	memset(&ss, 0, sizeof ss);
-	ss.hdr.type    = VIRTIO_GPU_CMD_SET_SCANOUT;
-	ss.r.x = 0; ss.r.y = 0; ss.r.width = DRAW_WIDTH; ss.r.height = DRAW_HEIGHT;
-	ss.scanout_id  = 0;
-	ss.resource_id = RESOURCE_ID;
-	gpu_cmd(&ss, sizeof ss, &rsp, sizeof rsp);
-
-	microkit_dbg_puts("display_pd: framebuffer attached\n");
+	/* No extra step required for flat VGA LFB */
+	microkit_dbg_puts("display_pd: framebuffer is ready\n");
 }
 
-/* Flush the entire framebuffer to the GPU scanout */
 static void
 gpu_flush(void)
 {
-	GpuTransfer tr;
-	GpuFlush    fl;
-	GpuHdr      rsp;
-
-	/* Transfer host → device */
-	memset(&tr, 0, sizeof tr);
-	tr.hdr.type    = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
-	tr.r.x = 0; tr.r.y = 0; tr.r.width = DRAW_WIDTH; tr.r.height = DRAW_HEIGHT;
-	tr.offset      = 0;
-	tr.resource_id = RESOURCE_ID;
-	gpu_cmd(&tr, sizeof tr, &rsp, sizeof rsp);
-
-	/* Flush scanout */
-	memset(&fl, 0, sizeof fl);
-	fl.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-	fl.r.x = 0; fl.r.y = 0; fl.r.width = DRAW_WIDTH; fl.r.height = DRAW_HEIGHT;
-	fl.resource_id = RESOURCE_ID;
-	gpu_cmd(&fl, sizeof fl, &rsp, sizeof rsp);
+	/* Copy the shared framebuffer BGRA pixels directly to the flat VGA LFB BAR 0 */
+	memmove((void*)vga_fb, (void*)(FB_PHYS + FB_HEADER_SIZE), DRAW_FBSIZE);
+	__asm__ volatile("dsb sy; isb" ::: "memory");
 }
 
 void
 init(void)
 {
-	microkit_dbg_puts("display_pd: starting\n");
+	microkit_dbg_puts("display_pd: starting VGA mode\n");
 	gpu_init();
-	gpu_create_fb();
+	if(gpu_ok)
+		gpu_create_fb();
 	microkit_dbg_puts("display_pd: ready\n");
 }
 
 void
 notified(microkit_channel ch)
 {
-	if(ch == 2)   /* SEL4_DRAW_CH from plan9_root */
+	if(ch == 2 && gpu_ok)
 		gpu_flush();
 }

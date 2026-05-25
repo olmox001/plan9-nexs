@@ -247,3 +247,39 @@ dupfgrp(Fgrp *f)
 	unlock(&f->lock_member);
 	return nf;
 }
+
+/* fdinstall: install Chan c at a specific file descriptor slot. */
+void
+fdinstall(int fd, Chan *c)
+{
+	Fgrp *f;
+
+	if(up == nil || up->fgrp == nil)
+		error("no fgrp");
+	f = up->fgrp;
+
+	if(fd < 0 || fd >= FGMAX)
+		error("bad fd");
+
+	lock(&f->lock_member);
+	if(fd >= f->nfd) {
+		if(waserror()) {
+			unlock(&f->lock_member);
+			nexterror();
+		}
+		fgrowfd(f, fd);
+		poperror();
+	}
+	if(f->fd[fd] != nil) {
+		Chan *oc = f->fd[fd];
+		f->fd[fd] = c;
+		unlock(&f->lock_member);
+		cclose(oc);
+	} else {
+		f->fd[fd] = c;
+		if(fd > f->maxfd)
+			f->maxfd = fd;
+		unlock(&f->lock_member);
+	}
+}
+

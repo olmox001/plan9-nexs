@@ -19,6 +19,9 @@ extern Dev srvdevtab;
 extern Dev drawdevtab;
 extern Dev mousedevtab;
 
+/* syscall.c */
+extern void svc_init(void);
+
 /* ── Kernel panic ─────────────────────────────────────────────────────────── */
 void
 panic(char *fmt, ...)
@@ -46,6 +49,41 @@ void
 plan9_microkit_notify(int ch)
 {
 	microkit_notify(ch);
+}
+
+/*
+ * uart_kbd_poll: drain the PL011 RX FIFO and feed characters to consinput().
+ * Called both from the UART IRQ notified handler and as a polling fallback
+ * in microkit_idle_wait so UART-typed characters reach cons_rdz promptly.
+ * PL011 registers: DR at offset 0x00, FR at offset 0x18 (index 6).
+ *   FR bit 4 = RXFE (receive FIFO empty).
+ */
+static void
+uart_kbd_poll(void)
+{
+	volatile u32int *uart = (volatile u32int*)0x09000000;
+	while(!(uart[6] & (1u << 4)))
+		consinput((int)(uart[0] & 0xff));
+}
+
+/*
+ * microkit_idle_wait: called from sched.c when no Plan 9 proc is ready.
+ * Polls UART for keyboard input, then blocks at the seL4 level (via
+ * seL4_Wait) so other PDs (9pserver, display, input) get CPU time.
+ * On return, dispatches each set badge bit as a channel notification.
+ */
+void
+microkit_idle_wait(void)
+{
+	seL4_Word badge = 0;
+	int ch;
+	uart_kbd_poll();
+	if(anyready())
+		return;
+	seL4_Wait(1, &badge);
+	for(ch = 0; badge != 0; ch++, badge >>= 1)
+		if(badge & 1)
+			notified((microkit_channel)ch);
 }
 
 /* ── Namespace bootstrap ──────────────────────────────────────────────────── */
@@ -131,6 +169,23 @@ init9(void *arg)
 
 	putstrn("Plan 9: execing rc\n", 19);
 
+	/* Verify 9P rootfs: read /rc/bin/termrc and print it */
+	if(waserror()) {
+		putstrn("Plan 9: termrc read failed\n", 27);
+		poperror();
+	} else {
+		Chan *tc = namec("/rc/bin/termrc", Aopen, OREAD, 0);
+		char tbuf[256];
+		long tn = devtab[tc->type]->read(tc, tbuf, sizeof(tbuf)-1, 0);
+		if(tn > 0) {
+			tbuf[tn] = '\0';
+			putstrn("termrc: ", 8);
+			putstrn(tbuf, tn);
+		}
+		cclose(tc);
+		poperror();
+	}
+
 	/* Exec the rc shell from the rootfs */
 	{
 		char *rcargs[] = { "/bin/rc", "-l", nil };
@@ -181,24 +236,27 @@ init(void)
 	uart_init();
 	putstrn("Plan 9 on seL4\n", 15);
 
-	/* 2. Processor and memory */
+	/* 2. Syscall gate — must be before any user process */
+	svc_init();
+
+	/* 3. Processor and memory */
 	machinit();
 	confinit();
 	xinit();
 	printinit();
 
-	/* 3. Scheduler */
+	/* 4. Scheduler */
 	procinit();
 
-	/* 4. Initialize all devices */
+	/* 5. Initialize all devices */
 	devsinit();
 
 	putstrn("Plan 9: boot\n", 13);
 
-	/* 5. Create init process */
+	/* 6. Create init process */
 	kproc("init9", init9, nil);
 
-	/* 6. Start cooperative scheduler — never returns */
+	/* 7. Start cooperative scheduler — never returns */
 	schedinit();
 }
 
@@ -219,6 +277,11 @@ notified(microkit_channel ch)
 	case 3:
 		/* Mouse/keyboard event from input_pd */
 		mouseinput();
+		break;
+	case 4:
+		/* UART RX IRQ — drain RX FIFO into cons keyboard buffer */
+		uart_kbd_poll();
+		microkit_irq_ack(4);
 		break;
 	/* ch == 2: display flush ACK — no action needed in plan9_root */
 	}

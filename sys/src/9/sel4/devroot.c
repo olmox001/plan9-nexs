@@ -1,16 +1,17 @@
 /*
- * devroot.c — Self-contained root VFS device for Plan 9 on seL4.
+ * devroot.c — Root filesystem device (#/) for Plan 9 on seL4.
  *
- * This device implements the '/' namespace with a /sel4 subdirectory
- * and a virtual /sel4/hello.txt file backed by the 9P seL4 transport.
+ * Proxies VFS calls to 9pserver via 9P2000 over the shared ring buffer
+ * (devmntsel4 transport).  One persistent session (Tversion + Tattach)
+ * is established on first rootattach.  Each Chan gets its own fid so
+ * concurrent file opens work correctly in a cooperative scheduler.
  *
- * Design constraints:
- *   - rootwalk is heap-free: uses a static oversized Walkqid pool.
- *   - No calls to devwalk, devclone, isdir or newchan.
- *   - No dependency on devtab[c->type] (which requires a registered device).
- *
- * All of the above are impossible to use during early boot on seL4 Microkit
- * because they require xinit(), a registered devtab, and a complete Proc.
+ * Fid lifecycle:
+ *   rootattach → Twalk(ROOT_FID, clone, nwname=0)   → c->aux = clone
+ *   rootwalk   → Twalk(c->aux, walked, names)       → clunk old, c->aux = walked
+ *   rootopen   → Topen(c->aux)
+ *   rootread   → Tread(c->aux, ...)
+ *   rootclose  → Tclunk(c->aux)
  */
 
 #include <u.h>
@@ -20,292 +21,325 @@
 #include "fns.h"
 #include "../port/error.h"
 
-enum {
-	Qroot  = 0,
-	Qsel4  = 1,
-	Qhello = 2,
-};
+extern Dev mntsel4devtab;
 
-/*
- * Static Walkqid pool — holds up to 8 Qids, more than enough for our
- * flat two-level namespace. Safe because seL4 Microkit is single-threaded
- * within a Protection Domain (cooperative scheduling).
- */
-typedef struct {
-	Walkqid wq;
-	Qid     extra[7]; /* brings total embedded Qid count to 8 */
-} WalkqidPool;
+/* ── Persistent 9P session state ─────────────────────────────────────────── */
 
-/* ── rootwalk: fully self-contained, heap-free path walk ─────────────────── */
-static Walkqid*
-rootwalk(Chan *c, Chan *nc, char **name, int nname)
+static int    fs_inited;
+static Chan   fs_mc;           /* transport Chan (Q9p in mntsel4) */
+static u16int fs_next_tag = 1;
+static u32int fs_next_fid = 1; /* fid 0 = ROOT_FID (from Tattach), never freed */
+
+#define ROOT_FID  0u
+
+static u32int
+fs_alloc_fid(void)
 {
-	static WalkqidPool pool;
-	static Chan clonechan;
-
-	memset(&pool, 0, sizeof(pool));
-
-	/*
-	 * Work on a clone of c so we can mutate qid as we traverse.
-	 * nc is ignored (we don't do heap allocation via devclone).
-	 */
-	USED(nc);
-	clonechan = *c;
-	Chan *cur = &clonechan;
-
-	int i;
-	for(i = 0; i < nname; i++) {
-		char *n = name[i];
-
-		/* "." — stays at current node */
-		if(strcmp(n, ".") == 0) {
-			pool.wq.qid[pool.wq.nqid++] = cur->qid;
-			continue;
-		}
-
-		/* ".." — always resolves to root */
-		if(strcmp(n, "..") == 0) {
-			cur->qid.path = Qroot;
-			cur->qid.type = QTDIR;
-			cur->qid.vers = 0;
-			pool.wq.qid[pool.wq.nqid++] = cur->qid;
-			continue;
-		}
-
-		switch((int)cur->qid.path) {
-		case Qroot:
-			if(strcmp(n, "sel4") == 0) {
-				cur->qid.path = Qsel4;
-				cur->qid.type = QTDIR;
-				cur->qid.vers = 0;
-				pool.wq.qid[pool.wq.nqid++] = cur->qid;
-				continue;
-			}
-			goto notfound;
-
-		case Qsel4:
-			if(strcmp(n, "hello.txt") == 0) {
-				cur->qid.path = Qhello;
-				cur->qid.type = QTFILE;
-				cur->qid.vers = 0;
-				pool.wq.qid[pool.wq.nqid++] = cur->qid;
-				continue;
-			}
-			goto notfound;
-
-		default:
-			/* Trying to walk into a file */
-			goto notfound;
-		}
-
-	notfound:
-		if(i == 0)
-			return nil; /* first element not found: fail entirely */
-		/* Partial walk: stop here */
-		goto done;
-	}
-
-done:
-	if(pool.wq.nqid == nname && nname > 0) {
-		/* Full walk succeeded */
-		pool.wq.clone = cur;
-	} else if(pool.wq.nqid == 0) {
-		return nil;
-	} else {
-		/* Partial walk: caller sees nqid < nname and clone == nil */
-		pool.wq.clone = nil;
-	}
-	return &pool.wq;
+	return fs_next_fid++;
 }
 
-/* ── rootreset / rootattach ───────────────────────────────────────────────── */
+static u16int
+fs_alloc_tag(void)
+{
+	return fs_next_tag++;
+}
+
+/* ── I/O buffers: module-level to keep stack frames small ────────────────── */
+
+static uchar fs_tx[512];
+static uchar fs_rx[8192];
+
+/*
+ * fs_rpc: marshal req → send → receive → unmarshal rep.
+ * Calls error() on transport failure or Rerror from server.
+ */
+static void
+fs_rpc(Fcall *req, Fcall *rep)
+{
+	int nw, nr;
+
+	nw = convS2M(req, fs_tx, sizeof fs_tx);
+	if(nw <= 0)
+		error("fs_rpc: convS2M failed");
+
+	mntsel4devtab.write(&fs_mc, fs_tx, nw, 0);
+
+	nr = mntsel4devtab.read(&fs_mc, fs_rx, sizeof fs_rx, 0);
+	if(nr <= 0)
+		error("fs_rpc: no response");
+	if(convM2S(fs_rx, nr, rep) <= 0)
+		error("fs_rpc: bad response");
+	if(rep->type == Rerror)
+		error(rep->ename);
+}
+
+/* fs_clunk: release a fid; errors suppressed (close must not fail). */
+static void
+fs_clunk(u32int fid)
+{
+	Fcall req, rep;
+
+	if(!fs_inited || fid == ROOT_FID)
+		return;
+	if(waserror()) {
+		return;
+	}
+	memset(&req, 0, sizeof req);
+	req.type = Tclunk;
+	req.tag  = fs_alloc_tag();
+	req.fid  = fid;
+	fs_rpc(&req, &rep);
+	poperror();
+}
+
+/*
+ * fs_init: establish 9P session via Tversion + Tattach.
+ * Idempotent: returns immediately if already done.
+ * Must be called with up != nil (i.e., from a running proc).
+ */
+static void
+fs_init(void)
+{
+	Fcall req, rep;
+
+	if(fs_inited)
+		return;
+
+	/* Point fs_mc at the Q9p transport file without going through attach/walk.
+	 * mntsel4read/write only check c->qid.path == Q9p (=1), nothing else. */
+	memset(&fs_mc, 0, sizeof fs_mc);
+	fs_mc.qid.path = 1;   /* Q9p */
+	fs_mc.qid.type = QTFILE;
+
+	/* Tversion */
+	memset(&req, 0, sizeof req);
+	req.type    = Tversion;
+	req.tag     = NOTAG;
+	req.msize   = 8192;
+	req.version = "9P2000";
+	fs_rpc(&req, &rep);
+
+	/* Tattach: ROOT_FID becomes the permanent root handle */
+	memset(&req, 0, sizeof req);
+	req.type  = Tattach;
+	req.tag   = fs_alloc_tag();
+	req.fid   = ROOT_FID;
+	req.afid  = NOFID;
+	req.uname = "root";
+	req.aname = "";
+	fs_rpc(&req, &rep);
+
+	fs_inited = 1;
+	putstrn("devroot: 9P session up\n", 23);
+}
+
+/* ── Device operations ────────────────────────────────────────────────────── */
+
 static void
 rootreset(void)
 {
 }
 
+/*
+ * rootattach: open the root namespace.
+ * Establishes the 9P session once, then clones ROOT_FID so each
+ * caller gets its own fid to walk/open/close independently.
+ */
 static Chan*
 rootattach(char *spec)
 {
-	USED(spec);
-	return nil; /* not used in standalone early-boot test */
-}
+	Fcall   req, rep;
+	u32int  clone;
+	Chan   *c;
 
-/* ── rootstat ─────────────────────────────────────────────────────────────── */
-static int
-rootstat(Chan *c, uchar *db, int n)
-{
-	Dir d;
-	memset(&d, 0, sizeof(d));
+	fs_init();
 
-	switch((int)c->qid.path) {
-	case Qroot:
-		d.name = ".";
-		d.qid  = c->qid;
-		d.mode = DMDIR | 0555;
-		d.uid  = "root";
-		d.gid  = "root";
-		d.muid = "root";
-		break;
-	case Qsel4:
-		d.name = "sel4";
-		d.qid  = c->qid;
-		d.mode = DMDIR | 0555;
-		d.uid  = "root";
-		d.gid  = "root";
-		d.muid = "root";
-		break;
-	case Qhello:
-		d.name   = "hello.txt";
-		d.qid    = c->qid;
-		d.mode   = 0444;
-		d.length = 27;
-		d.uid    = "root";
-		d.gid    = "root";
-		d.muid   = "root";
-		break;
-	default:
-		return -1;
-	}
-	return convD2M(&d, db, n);
-}
+	/* Clone root fid (Twalk with nwname=0 per 9P spec) */
+	clone = fs_alloc_fid();
+	memset(&req, 0, sizeof req);
+	req.type   = Twalk;
+	req.tag    = fs_alloc_tag();
+	req.fid    = ROOT_FID;
+	req.newfid = clone;
+	req.nwname = 0;
+	fs_rpc(&req, &rep);
 
-/* ── rootopen ─────────────────────────────────────────────────────────────── */
-static Chan*
-rootopen(Chan *c, int omode)
-{
-	switch((int)c->qid.path) {
-	case Qroot:
-	case Qsel4:
-		if(omode != OREAD && omode != OEXEC)
-			error(Eperm);
-		break;
-	case Qhello:
-		c->offset = 0;
-		c->mode   = openmode(omode);
-		c->flag  |= COPEN;
-		break;
-	default:
-		error(Enonexist);
-	}
+	c = devattach('/', spec);
+	c->aux = (void*)(uintptr)clone;
 	return c;
 }
 
-/* ── rootclose ────────────────────────────────────────────────────────────── */
+/*
+ * rootwalk: walk names from c's current fid.
+ * On a full walk (nc == nil path from exec.c namec): c->aux is updated
+ * to the walked fid and the old clone is clunked.
+ */
+static Walkqid*
+rootwalk(Chan *c, Chan *nc, char **name, int nname)
+{
+	static struct {
+		Walkqid wq;
+		Qid     extra[MAXWELEM - 1];
+	} pool;
+	static Chan clonechan;
+
+	Fcall  req, rep;
+	u32int oldfid, newfid;
+	Chan  *dst;
+	int    i;
+
+	memset(&pool, 0, sizeof pool);
+
+	oldfid = (u32int)(uintptr)c->aux;
+	newfid = fs_alloc_fid();
+
+	memset(&req, 0, sizeof req);
+	req.type   = Twalk;
+	req.tag    = fs_alloc_tag();
+	req.fid    = oldfid;
+	req.newfid = newfid;
+	req.nwname = nname;
+	for(i = 0; i < nname && i < MAXWELEM; i++)
+		req.wname[i] = name[i];
+
+	fs_rpc(&req, &rep);  /* errors propagate to caller's waserror */
+
+
+	Qid *wqid = pool.wq.qid;
+	for(i = 0; i < rep.nwqid; i++) {
+		wqid[i] = rep.wqid[i];
+		pool.wq.nqid++;
+	}
+
+	if(rep.nwqid == nname) {
+		/* Full walk: oldfid (the pre-walk clone) is replaced by newfid */
+		if(oldfid != ROOT_FID)
+			fs_clunk(oldfid);
+		if(nc != nil) {
+			dst = nc;
+		} else {
+			clonechan = *c;
+			dst = &clonechan;
+			c->aux = (void*)(uintptr)newfid;
+		}
+		dst->aux = (void*)(uintptr)newfid;
+		dst->qid = rep.wqid[rep.nwqid - 1];
+		pool.wq.clone = dst;
+	} else {
+		/* Partial walk: return what we got; newfid is unusable, clunk it */
+		fs_clunk(newfid);
+		pool.wq.clone = nil;
+	}
+
+
+	return &pool.wq;
+}
+
+static int
+rootstat(Chan *c, uchar *db, int n)
+{
+	Fcall  req, rep;
+	u32int fid;
+
+	fid = (u32int)(uintptr)c->aux;
+	memset(&req, 0, sizeof req);
+	req.type = Tstat;
+	req.tag  = fs_alloc_tag();
+	req.fid  = fid;
+	fs_rpc(&req, &rep);
+
+	if(rep.nstat <= 0 || rep.nstat > n)
+		return -1;
+	memmove(db, rep.stat, rep.nstat);
+	return rep.nstat;
+}
+
+static Chan*
+rootopen(Chan *c, int omode)
+{
+	Fcall  req, rep;
+	u32int fid;
+
+	fid = (u32int)(uintptr)c->aux;
+	memset(&req, 0, sizeof req);
+	req.type = Topen;
+	req.tag  = fs_alloc_tag();
+	req.fid  = fid;
+	req.mode = omode & 3;
+	fs_rpc(&req, &rep);
+
+	c->qid    = rep.qid;
+	c->offset = 0;
+	c->flag  |= COPEN;
+	return c;
+}
+
 static void
 rootclose(Chan *c)
 {
-	USED(c);
+	u32int fid;
+
+	fid = (u32int)(uintptr)c->aux;
+	fs_clunk(fid);
+	c->aux = (void*)(uintptr)ROOT_FID;
 }
 
-/* ── rootread ─────────────────────────────────────────────────────────────── */
 static long
 rootread(Chan *c, void *buf, long n, vlong off)
 {
+	Fcall  req, rep;
+	u32int fid;
+	long   tot, chunk;
+
 	if(c->qid.type & QTDIR)
-		return 0; /* directory reads not implemented in this stub */
+		return 0;
 
-	if((int)c->qid.path == Qhello) {
-		extern Dev mntsel4devtab;
-		Chan mc;
-		uchar tx[256], rx[256];
-		Fcall req, rep;
-		int nw;
+	fid = (u32int)(uintptr)c->aux;
+	tot = 0;
+	while(tot < n) {
+		chunk = n - tot;
+		if(chunk > 4096)
+			chunk = 4096;
 
-		memset(&mc, 0, sizeof(mc));
-		mc.qid.path = 1; /* Q9p */
-		mc.qid.type = QTFILE;
-
-		/* 1. Tversion */
-		memset(&req, 0, sizeof(req));
-		req.type    = Tversion;
-		req.tag     = NOTAG;
-		req.msize   = 8192;
-		req.version = "9P2000";
-		nw = (int)convS2M(&req, tx, sizeof(tx));
-		if(nw <= 0) return -1;
-		mntsel4devtab.write(&mc, tx, nw, 0);
-		nw = mntsel4devtab.read(&mc, rx, sizeof(rx), 0);
-		if(nw <= 0) return -1;
-		if((int)convM2S(rx, nw, &rep) != nw) return -1;
-
-		/* 2. Tattach */
-		memset(&req, 0, sizeof(req));
-		req.type  = Tattach;
-		req.tag   = 0;
-		req.fid   = 0;
-		req.afid  = NOFID;
-		req.uname = "root";
-		req.aname = "";
-		nw = (int)convS2M(&req, tx, sizeof(tx));
-		if(nw <= 0) return -1;
-		mntsel4devtab.write(&mc, tx, nw, 0);
-		nw = mntsel4devtab.read(&mc, rx, sizeof(rx), 0);
-		if(nw <= 0) return -1;
-		if((int)convM2S(rx, nw, &rep) != nw) return -1;
-
-		/* 3. Twalk */
-		memset(&req, 0, sizeof(req));
-		req.type     = Twalk;
-		req.tag      = 1;
-		req.fid      = 0;
-		req.newfid   = 1;
-		req.nwname   = 1;
-		req.wname[0] = "hello.txt";
-		nw = (int)convS2M(&req, tx, sizeof(tx));
-		if(nw <= 0) return -1;
-		mntsel4devtab.write(&mc, tx, nw, 0);
-		nw = mntsel4devtab.read(&mc, rx, sizeof(rx), 0);
-		if(nw <= 0) return -1;
-		if((int)convM2S(rx, nw, &rep) != nw) return -1;
-
-		/* 4. Topen */
-		memset(&req, 0, sizeof(req));
-		req.type = Topen;
-		req.tag  = 2;
-		req.fid  = 1;
-		req.mode = OREAD;
-		nw = (int)convS2M(&req, tx, sizeof(tx));
-		if(nw <= 0) return -1;
-		mntsel4devtab.write(&mc, tx, nw, 0);
-		nw = mntsel4devtab.read(&mc, rx, sizeof(rx), 0);
-		if(nw <= 0) return -1;
-		if((int)convM2S(rx, nw, &rep) != nw) return -1;
-
-		/* 5. Tread */
-		memset(&req, 0, sizeof(req));
+		memset(&req, 0, sizeof req);
 		req.type   = Tread;
-		req.tag    = 3;
-		req.fid    = 1;
-		req.offset = off;
-		req.count  = n;
-		nw = (int)convS2M(&req, tx, sizeof(tx));
-		if(nw <= 0) return -1;
-		mntsel4devtab.write(&mc, tx, nw, 0);
-		nw = mntsel4devtab.read(&mc, rx, sizeof(rx), 0);
-		if(nw <= 0) return -1;
-		if((int)convM2S(rx, nw, &rep) != nw) return -1;
+		req.tag    = fs_alloc_tag();
+		req.fid    = fid;
+		req.offset = (uvlong)(off + tot);
+		req.count  = (uint)chunk;
 
-		if(rep.type == Rread) {
-			if(rep.count > (uint)n)
-				rep.count = n;
-			memmove(buf, rep.data, rep.count);
-			return rep.count;
+		if(waserror()) {
+			if(tot > 0) {
+				poperror();
+				break;
+			}
+			nexterror();
 		}
-		return -1;
+		fs_rpc(&req, &rep);
+		poperror();
+
+		if(rep.count == 0)
+			break;
+		if(rep.count > (uint)chunk)
+			rep.count = (uint)chunk;
+		memmove((char*)buf + tot, rep.data, rep.count);
+		tot += rep.count;
+		if(rep.count < (uint)chunk)
+			break;
 	}
-	return 0;
+	return tot;
 }
 
-/* ── rootwrite ────────────────────────────────────────────────────────────── */
 static long
 rootwrite(Chan *c, void *buf, long n, vlong off)
 {
 	USED(c, buf, n, off);
+	error(Eperm);
 	return 0;
 }
 
 /* ── Device table ─────────────────────────────────────────────────────────── */
+
 Dev rootdevtab = {
 	'/',
 	"root",

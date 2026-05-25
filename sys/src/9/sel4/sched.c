@@ -131,7 +131,7 @@ kproc(char *name, void (*fn)(void*), void *arg)
 	p = allocproc();
 	if(p == nil)
 		panic("kproc: out of procs for %s", name);
-	kstrcpy(p->text, name, sizeof(p->text));
+	p->text = name;
 	p->kpfun = fn;
 	p->kparg = arg;
 	p->kp    = 1;
@@ -202,7 +202,7 @@ schedinit(void)
 
 	/* Idle until a proc becomes available */
 	while((p = sq_pop()) == nil)
-		coherence();
+		microkit_idle_wait();
 
 	up        = p;
 	m->proc   = up;

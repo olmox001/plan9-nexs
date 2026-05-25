@@ -38,14 +38,29 @@
     <memory_region name="pool_root"   size="0x4000000" page_size="0x200000" />
     <!-- 64KB 9P ring buffer for rootfs channel -->
     <memory_region name="shared_9p"   size="0x10000"                        />
-    <!-- 4MB framebuffer (plan9_root BGRA pixels -> display_pd -> GPU) -->
-    <memory_region name="framebuffer" size="0x400000"  page_size="0x200000" />
+    <!-- 4MB framebuffer (plan9_root BGRA pixels -> display_pd -> GPU)
+         Fixed phys_addr so display_pd can pass it as DMA backing address to virtio-gpu -->
+    <memory_region name="framebuffer" phys_addr="0x7d000000" size="0x400000" page_size="0x200000" />
+    <!-- 64KB DMA region for virtio-gpu descriptor tables and command buffers -->
+    <memory_region name="gpu_dma" phys_addr="0x7e000000" size="0x10000" />
+    <!-- 64KB DMA region for virtio-input (keyboard/tablet) descriptor tables -->
+    <memory_region name="input_dma" phys_addr="0x7f000000" size="0x10000" />
+    <!-- PCIe ECAM configuration space (1MB to scan slot 0..31) -->
+    <memory_region name="pci_ecam" phys_addr="0x3f000000" size="0x100000" />
+    <!-- VGA Framebuffer (16MB matching QEMU standard VGA BAR 0) -->
+    <memory_region name="vga_fb" phys_addr="0x38000000" size="0x1000000" />
+    <!-- VGA MMIO/VBE register page (4KB matching QEMU standard VGA BAR 2) -->
+    <memory_region name="vga_mmio" phys_addr="0x3c000000" size="0x1000" />
     <!-- 64KB input event ring (input_pd events -> plan9_root devmouse) -->
     <memory_region name="input_ring"  size="0x10000"                        />
+    <!-- 32MB userspace memory for running compiled ELF binaries (mapped at 0x00400000) -->
+    <memory_region name="userspace_mem" size="0x2000000" page_size="0x200000" />
 
     <!-- ── plan9_root: Plan 9 kernel + scheduler + all user processes ──── -->
     <protection_domain name="plan9_root" stack_size="0x200000" priority="99">
         <program_image path="plan9_root.elf" />
+        <!-- UART RX IRQ: PL011 SPI 1 → GIC IRQ 33 (level-triggered) -->
+        <irq irq="33" id="4" trigger="level" />
 
         <!-- Kernel heap at 0x10000000 (must match confinit()) -->
         <map mr="pool_root"   vaddr="0x10000000" perms="rw" cached="true"  />
@@ -57,6 +72,8 @@
         <map mr="framebuffer" vaddr="0x30000000" perms="rw" cached="true"  />
         <!-- Input ring at 0x40000000 (must match SEL4_INPUT_BASE in devmouse.c) -->
         <map mr="input_ring"  vaddr="0x40000000" perms="rw" cached="true"  />
+        <!-- Userspace program memory mapped at 0x00400000 (linked ELF load address) -->
+        <map mr="userspace_mem" vaddr="0x00400000" perms="rwx" cached="true" />
     </protection_domain>
 
     <!-- ── 9pserver: rootfs file server via 9P ──────────────────────────── -->
@@ -71,9 +88,15 @@
         <program_image path="display_pd.elf" />
         <!-- virtio_io page mapped at 0x0a003000; GPU regs are at +0xe00 = 0x0a003e00 -->
         <map mr="virtio_io"   vaddr="0x0a003000" perms="rw" cached="false" />
-        <!-- Framebuffer read access (GPU DMA reads pixels) -->
-        <map mr="framebuffer" vaddr="0x30000000" perms="r"  cached="true"  />
+        <!-- Framebuffer: mapped at phys addr (identity) so GPU DMA sees correct PA -->
+        <map mr="framebuffer" vaddr="0x7d000000" perms="r"  cached="true"  />
+        <!-- DMA region: identity-mapped so vaddr == phys_addr == QEMU DMA address -->
+        <map mr="gpu_dma"     vaddr="0x7e000000" perms="rw" cached="true" />
         <map mr="uart"        vaddr="0x09000000" perms="rw" cached="false" />
+        <!-- PCIe configuration space and VGA card BAR mapping -->
+        <map mr="pci_ecam"    vaddr="0x3f000000" perms="rw" cached="false" />
+        <map mr="vga_fb"      vaddr="0x38000000" perms="rw" cached="false" />
+        <map mr="vga_mmio"    vaddr="0x3c000000" perms="rw" cached="false" />
     </protection_domain>
 
     <!-- ── input_pd: keyboard and tablet driver ─────────────────────────── -->
@@ -83,8 +106,14 @@
         <map mr="virtio_io"  vaddr="0x0a003000" perms="rw" cached="false" />
         <!-- Input event ring: write mouse/kbd events here -->
         <map mr="input_ring" vaddr="0x40000000" perms="rw" cached="true"  />
+        <!-- DMA region: identity-mapped so vaddr == phys_addr == QEMU DMA address -->
+        <map mr="input_dma"  vaddr="0x7f000000" perms="rw" cached="true" />
         <!-- UART for keyboard -> console (plan9_root reads from UART ring) -->
         <map mr="uart"       vaddr="0x09000000" perms="rw" cached="false" />
+        <!-- Virtio Keyboard IRQ: GIC SPI 45 -> GIC IRQ 77 -->
+        <irq irq="77" id="1" />
+        <!-- Virtio Mouse/Tablet IRQ: GIC SPI 46 -> GIC IRQ 78 -->
+        <irq irq="78" id="2" />
     </protection_domain>
 
     <!-- ── Channels ─────────────────────────────────────────────────────── -->

@@ -23,6 +23,7 @@ extern void idlehands(void);
 #define PADDR(a)   ((uintptr)(a))
 #define KADDR(a)   ((void*)(a))
 #define VA(k)      ((uintptr)(k))
+extern int cankaddr(uintptr);
 
 /* ── Memory and processor initialization ────────────────────────────────── */
 extern void confinit(void);
@@ -68,6 +69,7 @@ extern Chan* fdtochan(int, int, int, int);
 extern int   newfd(Chan*, int);
 extern void  fdclose(int, int);
 extern Fgrp* dupfgrp(Fgrp*);
+extern void  fdinstall(int, Chan*);
 
 /* ── ELF loader / exec (exec.c) ─────────────────────────────────────────── */
 extern Proc* exec9p(char*, char**);
@@ -79,16 +81,22 @@ extern Chan* namec(char*, int, int, ulong);
 /* ── Mouse input handler (called from notified) ──────────────────────────── */
 extern void mouseinput(void);
 
+/* ── Keyboard input (called from UART IRQ handler or uart_kbd_poll) ─────── */
+extern void consinput(int c);
+
 /* ── 9P transport wakeup (called from notified when 9pserver replies) ─────── */
 extern void mnt9p_wakeup(void);
 
 /* ── seL4 notification wrapper ───────────────────────────────────────────── */
 extern void plan9_microkit_notify(int);
+extern void microkit_idle_wait(void);
+extern void microkit_dbg_puts(const char*);
 
 /* ── Chan error string helper ───────────────────────────────────────────── */
 extern void kstrcpy(char*, char*, int);
 extern int  rerrstr(char*, uint);
 
 /* readstr and procfdprint are declared in portfns.h with their canonical sigs */
+extern void devpipealloc(Chan* c[2]);
 
 #endif /* _SEL4_FNS_H_ */
